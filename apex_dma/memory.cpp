@@ -221,13 +221,62 @@ int Memory::open_proc(const char *name) {
               << info->name << " " << info->path << std::endl;
 
     // 修复cr3
-    const short MZ_HEADER = 0x5a4d;
-    char *base_section = new char[8];
-    long *base_section_value = (long *)base_section;
-    memset(base_section, 0, 8);
-    CSliceMut<uint8_t> slice(base_section, 8);
-    os.read_raw_into(proc.hProcess.info()->address + 0x520, slice); // win10
-    proc.baseaddr = *base_section_value;
+    struct cache {
+    uintptr_t Address;
+    MMPTE Value;
+};
+ 
+static cache cached_pml4e[512];
+static cache cached_pdpte[512];
+static cache cached_pde[512];
+static cache cached_pte[512];
+ 
+uintptr_t VirtualToPhysical(uintptr_t directoryTableBase, uintptr_t virtualAddress)
+{
+    virtual_address_t virtual_address{};
+    virtual_address.value = PVOID(virtualAddress);
+ 
+    SIZE_T Size = 0;
+ 
+    // PML4E
+    if (cached_pml4e[virtual_address.pml4_index].Address != directoryTableBase + 8 * virtual_address.pml4_index || !cached_pml4e[virtual_address.pml4_index].Value.u.Hard.Valid) {
+        cached_pml4e[virtual_address.pml4_index].Address = directoryTableBase + 8 * virtual_address.pml4_index;
+        ReadPhysical(cached_pml4e[virtual_address.pml4_index].Address, reinterpret_cast<PVOID>(&cached_pml4e[virtual_address.pml4_index].Value), 8, &Size);
+    }
+ 
+    if (!cached_pml4e[virtual_address.pml4_index].Value.u.Hard.Valid)
+        return 0;
+ 
+    // PDPTE
+    if (cached_pdpte[virtual_address.pdpt_index].Address != (cached_pml4e[virtual_address.pml4_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pdpt_index || !cached_pdpte[virtual_address.pdpt_index].Value.u.Hard.Valid) {
+        cached_pdpte[virtual_address.pdpt_index].Address = (cached_pml4e[virtual_address.pml4_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pdpt_index;
+        ReadPhysical(cached_pdpte[virtual_address.pdpt_index].Address, reinterpret_cast<PVOID>(&cached_pdpte[virtual_address.pdpt_index].Value), 8, &Size);
+    }
+ 
+    if (!cached_pdpte[virtual_address.pdpt_index].Value.u.Hard.Valid)
+        return 0;
+ 
+    // PDE
+    if (cached_pde[virtual_address.pd_index].Address != (cached_pdpte[virtual_address.pdpt_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pd_index || !cached_pde[virtual_address.pd_index].Value.u.Hard.Valid) {
+        cached_pde[virtual_address.pd_index].Address = (cached_pdpte[virtual_address.pdpt_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pd_index;
+        ReadPhysical(cached_pde[virtual_address.pd_index].Address, reinterpret_cast<PVOID>(&cached_pde[virtual_address.pd_index].Value), 8, &Size);
+    }
+ 
+    if (!cached_pde[virtual_address.pd_index].Value.u.Hard.Valid)
+        return 0;
+ 
+    // PTE
+    if (cached_pte[virtual_address.pt_index].Address != (cached_pde[virtual_address.pd_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pt_index || !cached_pte[virtual_address.pt_index].Value.u.Hard.Valid) {
+        cached_pte[virtual_address.pt_index].Address = (cached_pde[virtual_address.pd_index].Value.u.Hard.PageFrameNumber << 12) + 8 * virtual_address.pt_index;
+        ReadPhysical(cached_pte[virtual_address.pt_index].Address, reinterpret_cast<PVOID>(&cached_pte[virtual_address.pt_index].Value), 8, &Size);
+    }
+ 
+    if (!cached_pte[virtual_address.pt_index].Value.u.Hard.Valid)
+        return 0;
+ 
+    return (cached_pte[virtual_address.pt_index].Value.u.Hard.PageFrameNumber << 12) + virtual_address.offset;
+}
+
     // 遍历dtb
     for (size_t dtb = 0; dtb < SIZE_MAX; dtb += 0x1000) {
       proc.hProcess.set_dtb(dtb, Address_INVALID);
